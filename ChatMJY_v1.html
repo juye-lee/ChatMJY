@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
@@ -655,9 +655,10 @@ function deactivateLock(){
   isLocked=false;
   lockScreen.classList.remove('active');
 }
-lockInput.addEventListener('keydown',e=>{
+lockInput.addEventListener('keyup',e=>{
   if(e.key==='Enter'){
-    if(lockInput.value===LOCK_PASS){
+    const val=lockInput.value;
+    if(val===LOCK_PASS){
       deactivateLock();
     } else {
       lockError.textContent='암호가 틀렸습니다.';
