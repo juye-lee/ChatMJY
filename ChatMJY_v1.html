@@ -225,8 +225,8 @@ input::placeholder{color:var(--text3)}
 #enc-modal .modal-card{max-width:335px}
 
 /* ── SECURITY ALERT ── */
-#security-alert{display:none;position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:600;background:#fff0f0;border:1.5px solid #ffaaaa;border-radius:12px;padding:.75rem 1.25rem;box-shadow:var(--shadow-md);font-size:.83rem;color:#c0392b;align-items:center;gap:.65rem;white-space:nowrap}
-#security-alert.show{display:flex;animation:slideDown .3s ease}
+#security-alert{visibility:hidden;opacity:0;position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-10px);z-index:600;background:#fff0f0;border:1.5px solid #ffaaaa;border-radius:12px;padding:.75rem 1.25rem;box-shadow:var(--shadow-md);font-size:.83rem;color:#c0392b;display:flex;align-items:center;gap:.65rem;white-space:nowrap;transition:opacity .25s, transform .25s, visibility .25s}
+#security-alert.show{visibility:visible;opacity:1;transform:translateX(-50%) translateY(0)}
 @keyframes slideDown{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
 
 @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
@@ -236,7 +236,7 @@ input::placeholder{color:var(--text3)}
 <body>
 
 <!-- 보안 경고 토스트 -->
-<div id="security-alert">⚠️ <span id="security-alert-text"></span></div>
+<div id="security-alert"><span id="security-alert-text"></span></div>
 
 <!-- LOBBY -->
 <div id="lobby" class="screen active">
@@ -652,7 +652,7 @@ function playNotifSound() {
 // ══════════════════════════════════════════════
 let secAlertTimer = null;
 function showSecurityAlert(msg, duration = 4000) {
-  securityAlertText.textContent = msg;
+  securityAlertText.textContent = '⚠️ ' + msg;
   securityAlert.classList.add('show');
   clearTimeout(secAlertTimer);
   secAlertTimer = setTimeout(() => securityAlert.classList.remove('show'), duration);
