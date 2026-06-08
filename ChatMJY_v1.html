@@ -131,7 +131,17 @@ input::placeholder{color:var(--text3)}
 .bubble.short{white-space:nowrap;display:inline-block}.bubble.long{white-space:pre-wrap;display:block}
 .bubble.me{background:var(--bme);color:var(--bme-t);border-bottom-right-radius:4px}
 .bubble.friend{background:var(--bfr);color:var(--bfr-t);border:1px solid var(--border2);border-bottom-left-radius:4px}
-.bubble img{max-width:200px;border-radius:9px;display:block;margin-top:3px}
+/* 채팅 텍스트 복사 허용 */
+.bubble { user-select: text; }
+
+/* 이미지 클릭 확대 */
+.bubble img { max-width:200px; border-radius:9px; display:block; margin-top:3px; cursor:pointer; transition:opacity .15s; }
+.bubble img:hover { opacity:.88; }
+
+/* 이미지 확대 모달 */
+#img-modal { display:none; position:fixed; inset:0; z-index:700; background:rgba(0,0,0,.78); align-items:center; justify-content:center; cursor:zoom-out; backdrop-filter:blur(6px); }
+#img-modal.open { display:flex; }
+#img-modal img { max-width:90vw; max-height:90vh; border-radius:12px; box-shadow:0 8px 48px rgba(0,0,0,.5); object-fit:contain; user-select:none; }
 .file-bubble{display:flex;align-items:center;gap:.52rem;padding:.5rem .85rem;border-radius:13px;font-size:.82rem;box-shadow:var(--shadow);text-decoration:none;cursor:pointer}
 .file-bubble.me{background:var(--bme);color:var(--bme-t);border-bottom-right-radius:4px}
 .file-bubble.friend{background:var(--bfr);color:var(--bfr-t);border:1px solid var(--border2);border-bottom-left-radius:4px}
@@ -431,6 +441,9 @@ input::placeholder{color:var(--text3)}
   <div id="autolock-countdown" style="display:none">자동 잠금 후 <span id="autolock-since">0</span>초 경과</div>
   <div class="lock-hint">Enter를 눌러 잠금 해제</div>
 </div>
+
+<!-- 이미지 확대 모달 -->
+<div id="img-modal"><img id="img-modal-src" src="" alt=""></div>
 
 <input type="file" id="file-input" accept=".pdf,.ppt,.pptx,.hwp,.hwpx,.doc,.docx,.xls,.xlsx,.txt,.zip,.csv,image/*">
 
@@ -888,29 +901,31 @@ async function handleData(data) {
     return;
   }
 
+  if (data.type === 'img-chunk') { handleImgChunk(data); return; }
+
   if (data.type === 'msg') {
-    let text = data.text || '', imgSrc = data.imgSrc || null, fileData = data.file || null;
+    let text = data.text || '', imgSrc = null, fileData = data.file || null;
     if (cryptoKey) {
       if (data.enc) {
         const d = await decryptMsg(data.enc, cryptoKey);
         if (d === null) { addSysMsg('⚠️ 복호화 실패 — 암호화 키를 확인하세요', 'warn'); return; }
         text = d;
       }
-      if (data.encImg) {
-        const d = await decryptMsg(data.encImg, cryptoKey);
-        if (d === null) { addSysMsg('⚠️ 이미지 복호화 실패', 'warn'); return; }
-        imgSrc = d;
-      }
       if (data.encFile && data.encFileData) {
         const d = await decryptMsg(data.encFileData, cryptoKey);
         if (d === null) { addSysMsg('⚠️ 파일 복호화 실패', 'warn'); return; }
         fileData = {name:data.encFile.name, size:data.encFile.size, dataUrl:d};
       }
+    } else {
+      if (data.imgSrc) imgSrc = data.imgSrc;
+      if (data.file) fileData = data.file;
     }
-    addMsg(text, false, imgSrc, data.msgId, fileData);
-    if (document.visibilityState === 'visible' && !isLocked && conn && conn.open)
-      conn.send({type:'read', msgId:data.msgId});
-    playNotifSound(); sendOsNotif(friendNick || '새 메시지');
+    if (imgSrc || text || fileData) {
+      addMsg(text, false, imgSrc, data.msgId, fileData);
+      if (document.visibilityState === 'visible' && !isLocked && conn && conn.open)
+        conn.send({type:'read', msgId:data.msgId});
+      playNotifSound(); sendOsNotif(friendNick || '새 메시지');
+    }
     return;
   }
 
@@ -948,6 +963,60 @@ function updateFriendUI(online) {
 }
 
 // ══════════════════════════════════════════════
+//  이미지 청크 전송 (PeerJS 대용량 패킷 분할)
+// ══════════════════════════════════════════════
+const CHUNK_SIZE = 16384; // 16KB 단위 분할
+const pendingChunks = {}; // {msgId: {total, received, chunks[]}}
+
+async function sendImageChunked(src, msgId) {
+  if (!conn || !conn.open) return;
+  let data = src;
+  if (cryptoKey) data = await encryptMsg(src, cryptoKey);
+  const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
+  for (let i = 0; i < totalChunks; i++) {
+    conn.send({
+      type: 'img-chunk',
+      msgId,
+      index: i,
+      total: totalChunks,
+      chunk: data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+      encrypted: !!cryptoKey
+    });
+    // 청크 사이 짧은 딜레이 — 버퍼 오버플로 방지
+    await new Promise(r => setTimeout(r, 10));
+  }
+}
+
+async function handleImgChunk(data) {
+  const { msgId, index, total, chunk, encrypted } = data;
+  if (!pendingChunks[msgId]) pendingChunks[msgId] = { total, received: 0, chunks: [] };
+  const pc = pendingChunks[msgId];
+  pc.chunks[index] = chunk;
+  pc.received++;
+  if (pc.received === total) {
+    let full = pc.chunks.join('');
+    delete pendingChunks[msgId];
+    if (encrypted && cryptoKey) {
+      const dec = await decryptMsg(full, cryptoKey);
+      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패', 'warn'); return; }
+      full = dec;
+    }
+    addMsg('', false, full, msgId);
+    if (conn && conn.open) conn.send({ type: 'read', msgId });
+    playNotifSound(); sendOsNotif(friendNick || '새 메시지');
+  }
+}
+
+// ══════════════════════════════════════════════
+//  이미지 확대 모달
+// ══════════════════════════════════════════════
+const imgModal = document.getElementById('img-modal');
+const imgModalSrc = document.getElementById('img-modal-src');
+imgModal.addEventListener('click', () => imgModal.classList.remove('open'));
+document.addEventListener('keydown', e => { if (e.key === 'Escape') imgModal.classList.remove('open'); });
+function openImgModal(src) { imgModalSrc.src = src; imgModal.classList.add('open'); }
+
+// ══════════════════════════════════════════════
 //  MESSAGES
 // ══════════════════════════════════════════════
 function nowStr() {
@@ -979,7 +1048,9 @@ function addMsg(text, isMine, imgSrc, remoteMsgId, fileData) {
     bubble = a;
   } else if (imgSrc) {
     bubble = document.createElement('div'); bubble.className='bubble '+(isMine?'me':'friend')+' long';
-    const img = document.createElement('img'); img.src = imgSrc; bubble.appendChild(img);
+    const img = document.createElement('img'); img.src = imgSrc;
+    img.addEventListener('click', () => openImgModal(imgSrc));
+    bubble.appendChild(img);
   } else {
     bubble = document.createElement('div'); bubble.className='bubble '+(isMine?'me':'friend')+' '+bubbleLenClass(text);
     bubble.textContent = text;
@@ -988,8 +1059,21 @@ function addMsg(text, isMine, imgSrc, remoteMsgId, fileData) {
   const meta = document.createElement('div'); meta.className = 'msg-meta';
   if (isMine) { const r = document.createElement('span'); r.className='read-status unread'; r.dataset.msgid=id; r.textContent='✓ 안읽음'; meta.appendChild(r); }
   const t = document.createElement('span'); t.className='meta-time'; t.textContent=nowStr(); meta.appendChild(t);
-  // 만료 타이머
+  // 만료 타이머 (5시간 미만일 때만 표시)
   const timerEl = document.createElement('span'); timerEl.className='msg-timer'; meta.appendChild(timerEl);
+
+  // 텍스트 메시지 복사 버튼
+  if (text && !imgSrc && !fileData) {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'react-btn'; copyBtn.textContent = '📋';
+    copyBtn.title = '복사';
+    copyBtn.style.cssText = 'margin-left:3px;padding:1px 6px;font-size:.72rem;';
+    copyBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(text).then(() => { copyBtn.textContent='✓'; setTimeout(()=>copyBtn.textContent='📋', 1500); }).catch(()=>{});
+    });
+    meta.appendChild(copyBtn);
+  }
 
   if (isMine) { wrap.appendChild(meta); wrap.appendChild(bubble); }
   else { wrap.appendChild(bubble); wrap.appendChild(meta); }
@@ -1015,9 +1099,11 @@ function addMsg(text, isMine, imgSrc, remoteMsgId, fileData) {
       const n = document.createElement('div'); n.className='sys-msg'; n.innerHTML='<div class="sys-msg-inner">메시지가 만료되어 삭제됐습니다</div>';
       row.replaceWith(n); setTimeout(() => n.remove(), 3000); return;
     }
-    const h = Math.floor(remaining/3600000), m = Math.floor((remaining%3600000)/60000), s = Math.floor((remaining%60000)/1000);
-    timerEl.textContent = h > 0 ? h+'h '+m+'m 후 삭제' : m > 0 ? m+'분 '+s+'초 후 삭제' : s+'초 후 삭제';
-    timerEl.className = 'msg-timer' + (remaining < 60000 ? ' danger' : remaining < 300000 ? ' warn' : '');
+    // 1시간 이상 남았으면 타이머 표시 안 함
+    if (remaining >= 3600000) { timerEl.textContent = ''; setTimeout(updateTimer, 60000); return; }
+    const m = Math.floor(remaining / 60000), s = Math.floor((remaining % 60000) / 1000);
+    timerEl.textContent = m > 0 ? m+'분 후 삭제' : s+'초 후 삭제';
+    timerEl.className = 'msg-timer' + (remaining < 60000 ? ' danger' : ' warn');
     setTimeout(updateTimer, remaining < 60000 ? 1000 : 30000);
   };
   setTimeout(updateTimer, 1000);
@@ -1091,13 +1177,9 @@ fileInput.addEventListener('change', e => {
 async function sendImage(file) {
   const r = new FileReader();
   r.onload = async ev => {
-    const src = ev.target.result, id = addMsg('', true, src);
-    if (conn && conn.open) {
-      const p = {type:'msg', text:'', msgId:id};
-      if (cryptoKey) p.encImg = await encryptMsg(src, cryptoKey);
-      else p.imgSrc = src;
-      conn.send(p);
-    }
+    const src = ev.target.result;
+    const id = addMsg('', true, src);
+    await sendImageChunked(src, id);
   };
   r.readAsDataURL(file);
 }
@@ -1137,13 +1219,9 @@ document.addEventListener('paste', e => {
 });
 pasteSendBtn.addEventListener('click', async () => {
   if (!pasteBuffer) return;
-  const src = pasteBuffer.dataUrl, id = addMsg('', true, src);
-  if (conn && conn.open) {
-    const p = {type:'msg', text:'', msgId:id};
-    if (cryptoKey) p.encImg = await encryptMsg(src, cryptoKey);
-    else p.imgSrc = src;
-    conn.send(p);
-  }
+  const src = pasteBuffer.dataUrl;
+  const id = addMsg('', true, src);
+  await sendImageChunked(src, id);
   pasteBuffer = null; pastePreview.classList.remove('show'); pastePreviewImg.src='';
 });
 pasteCancelBtn.addEventListener('click', () => { pasteBuffer=null; pastePreview.classList.remove('show'); pastePreviewImg.src=''; });
