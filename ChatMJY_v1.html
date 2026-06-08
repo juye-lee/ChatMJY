@@ -965,7 +965,7 @@ function updateFriendUI(online) {
 // ══════════════════════════════════════════════
 //  이미지 청크 전송 (PeerJS 대용량 패킷 분할)
 // ══════════════════════════════════════════════
-const CHUNK_SIZE = 16384; // 16KB 단위 분할
+const CHUNK_SIZE = 8192; // 8KB — PeerJS 안정 전송 크기
 const pendingChunks = {}; // {msgId: {total, received, chunks[]}}
 
 async function sendImageChunked(src, msgId) {
@@ -974,6 +974,7 @@ async function sendImageChunked(src, msgId) {
   if (cryptoKey) data = await encryptMsg(src, cryptoKey);
   const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
   for (let i = 0; i < totalChunks; i++) {
+    if (!conn || !conn.open) { addSysMsg('⚠️ 전송 중 연결이 끊겼습니다', 'warn'); return; }
     conn.send({
       type: 'img-chunk',
       msgId,
@@ -982,14 +983,14 @@ async function sendImageChunked(src, msgId) {
       chunk: data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
       encrypted: !!cryptoKey
     });
-    // 청크 사이 짧은 딜레이 — 버퍼 오버플로 방지
-    await new Promise(r => setTimeout(r, 10));
+    // PeerJS 버퍼 오버플로 방지 — 청크마다 충분한 대기
+    await new Promise(r => setTimeout(r, 30));
   }
 }
 
 async function handleImgChunk(data) {
   const { msgId, index, total, chunk, encrypted } = data;
-  if (!pendingChunks[msgId]) pendingChunks[msgId] = { total, received: 0, chunks: [] };
+  if (!pendingChunks[msgId]) pendingChunks[msgId] = { total, received: 0, chunks: new Array(total) };
   const pc = pendingChunks[msgId];
   pc.chunks[index] = chunk;
   pc.received++;
@@ -998,8 +999,10 @@ async function handleImgChunk(data) {
     delete pendingChunks[msgId];
     if (encrypted && cryptoKey) {
       const dec = await decryptMsg(full, cryptoKey);
-      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패', 'warn'); return; }
+      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패 — 암호화 키를 확인하세요', 'warn'); return; }
       full = dec;
+    } else if (encrypted && !cryptoKey) {
+      addSysMsg('⚠️ 암호화된 이미지인데 키가 없습니다', 'warn'); return;
     }
     addMsg('', false, full, msgId);
     if (conn && conn.open) conn.send({ type: 'read', msgId });
@@ -1061,19 +1064,6 @@ function addMsg(text, isMine, imgSrc, remoteMsgId, fileData) {
   const t = document.createElement('span'); t.className='meta-time'; t.textContent=nowStr(); meta.appendChild(t);
   // 만료 타이머 (5시간 미만일 때만 표시)
   const timerEl = document.createElement('span'); timerEl.className='msg-timer'; meta.appendChild(timerEl);
-
-  // 텍스트 메시지 복사 버튼
-  if (text && !imgSrc && !fileData) {
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'react-btn'; copyBtn.textContent = '📋';
-    copyBtn.title = '복사';
-    copyBtn.style.cssText = 'margin-left:3px;padding:1px 6px;font-size:.72rem;';
-    copyBtn.addEventListener('click', e => {
-      e.stopPropagation();
-      navigator.clipboard.writeText(text).then(() => { copyBtn.textContent='✓'; setTimeout(()=>copyBtn.textContent='📋', 1500); }).catch(()=>{});
-    });
-    meta.appendChild(copyBtn);
-  }
 
   if (isMine) { wrap.appendChild(meta); wrap.appendChild(bubble); }
   else { wrap.appendChild(bubble); wrap.appendChild(meta); }
