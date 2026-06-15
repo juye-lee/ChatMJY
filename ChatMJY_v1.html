@@ -451,7 +451,7 @@ input::placeholder{color:var(--text3)}
 'use strict';
 
 // ══════════════════════════════════════════════
-//  AES-256-GCM 암호화 (대용량 안전 처리)
+//  AES-256-GCM 암호화
 // ══════════════════════════════════════════════
 async function deriveKey(p) {
   const e = new TextEncoder();
@@ -461,38 +461,24 @@ async function deriveKey(p) {
     km, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']
   );
 }
-
-// btoa 대신 안전한 ArrayBuffer → base64 변환 (스택 오버플로 방지)
-function ab2b64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let bin = '';
-  const BLOCK = 8192;
-  for (let i = 0; i < bytes.length; i += BLOCK) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + BLOCK));
-  }
-  return btoa(bin);
-}
-function b642ab(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes.buffer;
-}
-
 async function encryptMsg(t, k) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, k, new TextEncoder().encode(t));
+  // 큰 데이터도 안전하게 변환 (btoa spread 방식은 스택 오버플로 발생)
   const combined = new Uint8Array(12 + ct.byteLength);
   combined.set(iv); combined.set(new Uint8Array(ct), 12);
-  return ab2b64(combined.buffer);
+  let bin = '';
+  for (let i = 0; i < combined.length; i += 8192)
+    bin += String.fromCharCode(...combined.subarray(i, i + 8192));
+  return btoa(bin);
 }
 async function decryptMsg(b, k) {
   try {
-    const buf = b642ab(b);
-    const iv = new Uint8Array(buf, 0, 12);
-    const ct = new Uint8Array(buf, 12);
-    const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv}, k, ct);
-    return new TextDecoder().decode(pt);
+    const bin = atob(b);
+    const c = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) c[i] = bin.charCodeAt(i);
+    const p = await crypto.subtle.decrypt({name:'AES-GCM', iv:c.slice(0,12)}, k, c.slice(12));
+    return new TextDecoder().decode(p);
   } catch { return null; }
 }
 
@@ -770,12 +756,13 @@ function initPeer() {
     if (err.type === 'unavailable-id') { lobbyStatus.textContent = 'ID 재등록 중...'; setTimeout(() => initPeer(), 3000); return; }
     lobbyStatus.textContent = '연결 오류: ' + err.type;
   });
-  // 들어오는 연결 처리
+  // 들어오는 연결 — 제3자 감지 포함
   peer.on('connection', inc => {
     const incomingId = inc.peer;
-    // 이미 열린 연결이 있고 다른 ID면 보안 경고 후 차단
-    if (conn && conn.open && conn.peer !== incomingId) {
-      showSecurityAlert('알 수 없는 외부 접속 시도 차단', 5000);
+    const isKnownFriend = getSavedFriendId() === incomingId;
+    // 이미 다른 연결이 열려있고, 새 연결이 알 수 없는 ID인 경우 경고
+    if (conn && conn.open && !isKnownFriend) {
+      showSecurityAlert('⚠️ 알 수 없는 외부 접속 시도: ' + incomingId.slice(0,16) + '...', 7000);
       addSysMsg('🚨 알 수 없는 사용자(' + incomingId.slice(0,12) + '...)가 접속을 시도했습니다.', 'warn');
       inc.close();
       return;
@@ -821,7 +808,7 @@ reconnectBtn.addEventListener('click', async () => {
   if (!checkEncKey()) return;
   await applyLobbyInputs();
   const fid = getSavedFriendId(); if (!fid || !myPeerId) return;
-  const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json'});
+  const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
   setupConnection(c, fid); showChat(); addSysMsg('이전 친구에게 재연결 중...');
 });
 clearSavedBtn.addEventListener('click', () => { clearFriend(); savedBanner.classList.remove('show'); });
@@ -836,7 +823,7 @@ joinBtn.addEventListener('click', async () => {
   const code = joinCodeInput.value.trim(); if (!code) { joinCodeInput.focus(); return; }
   if (!checkEncKey()) return;
   await applyLobbyInputs(); if (!myPeerId) { lobbyStatus.textContent = '잠시 후 다시 시도하세요'; return; }
-  const c = peer.connect(code, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json'});
+  const c = peer.connect(code, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
   setupConnection(c, code); showChat(); addSysMsg('연결 중...');
 });
 
@@ -850,22 +837,19 @@ function showChat() {
 //  CONNECTION SETUP
 // ══════════════════════════════════════════════
 function setupConnection(c, remotePeerId) {
-  // 이미 같은 상대와 연결이 열려있으면 무시 (재연결 루프 방지)
-  if (conn && conn.open && conn.peer === remotePeerId) return;
-  // 기존 연결이 열려있으면 닫지 않고 유지 — 새 연결이 open될 때 교체
-  const prevConn = conn;
+  if (conn) { try { conn.close(); } catch(e) {} }
   conn = c;
 
+  // hello 수신 타임아웃 — 10초 내 hello 없으면 의심 접속
   clearTimeout(helloTimeout);
   helloTimeout = setTimeout(() => {
-    if (conn === c && conn.open && !friendOnline) {
-      showSecurityAlert('응답 없는 연결이 감지됐습니다.', 5000);
+    if (conn && conn.open && !friendOnline) {
+      showSecurityAlert('⚠️ 상대방이 hello를 보내지 않았어요. 의심스러운 연결일 수 있어요.', 6000);
+      addSysMsg('⚠️ 연결됐지만 응답이 없는 사용자가 감지됐습니다.', 'warn');
     }
   }, 10000);
 
   conn.on('open', () => {
-    // 이전 연결이 있으면 이제 닫기
-    if (prevConn && prevConn !== c) { try { prevConn.close(); } catch(e) {} }
     connectedPeers.add(remotePeerId);
     if (conn.metadata && conn.metadata.nick) {
       friendNick = conn.metadata.nick;
@@ -873,7 +857,9 @@ function setupConnection(c, remotePeerId) {
     }
     conn.send({type:'hello', nick:myNick, peerId:FIXED_MY_ID, ts:Date.now()});
     reconnectAttempts = 0; friendOnline = true; updateFriendUI(true); renderMembers();
-    addSysMsg('🟢 ' + (friendNick || remotePeerId.slice(0,12)) + '님이 입장했습니다.', 'join');
+    // 입장 알림 — 채팅방에 표시
+    const displayId = (remotePeerId || conn.peer || '').slice(0, 12);
+    addSysMsg('🟢 ' + (friendNick || displayId) + '님이 입장했습니다.', 'join');
     if (cryptoKey) addSysMsg('🔐 AES-256 암호화 활성화됨.');
     checkSavedFriend();
   });
@@ -881,34 +867,24 @@ function setupConnection(c, remotePeerId) {
   conn.on('data', handleData);
 
   conn.on('close', () => {
-    // 이미 다른 연결로 교체된 경우엔 무시
-    if (conn !== c) return;
-    addSysMsg('🔴 ' + (friendNick || '상대방') + '님이 나갔습니다.', 'leave');
+    const name = friendNick || '상대방';
+    addSysMsg('🔴 ' + name + '님이 나갔습니다.', 'leave');
     connStatusHeader.textContent = '연결 끊김';
     typingIndicator.style.display = 'none';
     friendOnline = false; renderMembers(); conn = null;
     scheduleReconnect();
   });
-
-  conn.on('error', err => {
-    if (conn !== c) return;
-    friendOnline = false; renderMembers(); conn = null;
-    scheduleReconnect();
-  });
+  conn.on('error', () => { friendOnline = false; renderMembers(); conn = null; scheduleReconnect(); });
 }
 
-let isReconnecting = false;
 function scheduleReconnect() {
   const fid = getSavedFriendId(); if (!fid || !myPeerId) return;
-  if (isReconnecting) return; // 중복 재연결 방지
-  isReconnecting = true;
   const delay = Math.min(3000 * (reconnectAttempts + 1), 30000); reconnectAttempts++;
   setTimeout(async () => {
-    isReconnecting = false;
-    if (conn && conn.open) return; // 이미 연결됐으면 중단
+    if (conn && conn.open) return;
     if (encPassphrase && !cryptoKey) cryptoKey = await deriveKey(encPassphrase);
     addSysMsg('재연결 시도 중...');
-    const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json'});
+    const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
     setupConnection(c, fid);
   }, delay);
 }
@@ -933,24 +909,6 @@ async function handleData(data) {
   }
 
   if (data.type === 'img-chunk') { handleImgChunk(data); return; }
-
-  // 이미지 단일 패킷 수신
-  if (data.type === 'img') {
-    let imgSrc = null;
-    if (data.encImg && cryptoKey) {
-      const dec = await decryptMsg(data.encImg, cryptoKey);
-      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패 — 암호화 키를 확인하세요', 'warn'); return; }
-      imgSrc = dec;
-    } else if (data.imgSrc) {
-      imgSrc = data.imgSrc;
-    }
-    if (imgSrc) {
-      addMsg('', false, imgSrc, data.msgId);
-      if (conn && conn.open) conn.send({ type: 'read', msgId: data.msgId });
-      playNotifSound(); sendOsNotif(friendNick || '새 메시지');
-    }
-    return;
-  }
 
   if (data.type === 'msg') {
     let text = data.text || '', imgSrc = null, fileData = data.file || null;
@@ -981,7 +939,8 @@ async function handleData(data) {
   if (data.type === 'read') { markAsRead(data.msgId); return; }
   if (data.type === 'reaction') { applyReaction(data.msgId, data.emoji); return; }
   if (data.type === 'typing') { typingIndicator.style.display = data.value ? 'flex' : 'none'; return; }
-  // 위 목록에 없는 타입만 경고 (내부 패킷 오탐 방지)
+  // 위에 해당 없는 알 수 없는 패킷만 경고
+  if (data.type) showSecurityAlert('알 수 없는 데이터 패킷을 수신했습니다.', 3000);
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -1010,53 +969,46 @@ function updateFriendUI(online) {
 }
 
 // ══════════════════════════════════════════════
-//  이미지 전송 — Canvas 압축 후 단일 패킷 전송
+//  이미지 청크 전송 (PeerJS 대용량 패킷 분할)
 // ══════════════════════════════════════════════
-const pendingChunks = {}; // 하위 호환용 (청크 방식 수신 잔존 처리)
+const CHUNK_SIZE = 8192; // 8KB — PeerJS 안정 전송 크기
+const pendingChunks = {}; // {msgId: {total, received, chunks[]}}
 
-// 이미지를 Canvas로 리사이즈+압축해서 크기 줄이기
-function compressImage(dataUrl, maxW, maxH, quality) {
-  return new Promise(resolve => {
-    const img = new Image();
-    img.onload = () => {
-      let w = img.width, h = img.height;
-      if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
-      if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-      resolve(canvas.toDataURL('image/jpeg', quality));
-    };
-    img.src = dataUrl;
-  });
-}
-
-async function sendImageSingle(src, msgId) {
-  if (!conn || !conn.open) { addSysMsg('⚠️ 연결되지 않았습니다', 'warn'); return; }
-  // 800px 이하, 품질 0.6으로 압축 — 전송 패킷 크기 최소화
-  const compressed = await compressImage(src, 800, 800, 0.6);
-  const p = { type: 'img', msgId };
-  if (cryptoKey) {
-    p.encImg = await encryptMsg(compressed, cryptoKey);
-  } else {
-    p.imgSrc = compressed;
+async function sendImageChunked(src, msgId) {
+  if (!conn || !conn.open) return;
+  let data = src;
+  if (cryptoKey) data = await encryptMsg(src, cryptoKey);
+  const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
+  for (let i = 0; i < totalChunks; i++) {
+    if (!conn || !conn.open) { addSysMsg('⚠️ 전송 중 연결이 끊겼습니다', 'warn'); return; }
+    conn.send({
+      type: 'img-chunk',
+      msgId,
+      index: i,
+      total: totalChunks,
+      chunk: data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+      encrypted: !!cryptoKey
+    });
+    // PeerJS 버퍼 오버플로 방지 — 청크마다 충분한 대기
+    await new Promise(r => setTimeout(r, 30));
   }
-  conn.send(p);
 }
 
 async function handleImgChunk(data) {
-  // 구버전 청크 호환 처리 (현재는 사용 안 함)
   const { msgId, index, total, chunk, encrypted } = data;
   if (!pendingChunks[msgId]) pendingChunks[msgId] = { total, received: 0, chunks: new Array(total) };
   const pc = pendingChunks[msgId];
-  pc.chunks[index] = chunk; pc.received++;
+  pc.chunks[index] = chunk;
+  pc.received++;
   if (pc.received === total) {
     let full = pc.chunks.join('');
     delete pendingChunks[msgId];
     if (encrypted && cryptoKey) {
       const dec = await decryptMsg(full, cryptoKey);
-      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패', 'warn'); return; }
+      if (dec === null) { addSysMsg('⚠️ 이미지 복호화 실패 — 암호화 키를 확인하세요', 'warn'); return; }
       full = dec;
+    } else if (encrypted && !cryptoKey) {
+      addSysMsg('⚠️ 암호화된 이미지인데 키가 없습니다', 'warn'); return;
     }
     addMsg('', false, full, msgId);
     if (conn && conn.open) conn.send({ type: 'read', msgId });
@@ -1223,7 +1175,7 @@ async function sendImage(file) {
   r.onload = async ev => {
     const src = ev.target.result;
     const id = addMsg('', true, src);
-    await sendImageSingle(src, id);
+    await sendImageChunked(src, id);
   };
   r.readAsDataURL(file);
 }
@@ -1265,8 +1217,8 @@ pasteSendBtn.addEventListener('click', async () => {
   if (!pasteBuffer) return;
   const src = pasteBuffer.dataUrl;
   const id = addMsg('', true, src);
-  await sendImageSingle(src, id);
-  pasteBuffer = null; pastePreview.classList.remove('show'); pastePreviewImg.src = '';
+  await sendImageChunked(src, id);
+  pasteBuffer = null; pastePreview.classList.remove('show'); pastePreviewImg.src='';
 });
 pasteCancelBtn.addEventListener('click', () => { pasteBuffer=null; pastePreview.classList.remove('show'); pastePreviewImg.src=''; });
 
