@@ -451,7 +451,7 @@ input::placeholder{color:var(--text3)}
 'use strict';
 
 // ══════════════════════════════════════════════
-//  AES-256-GCM 암호화
+//  AES-256-GCM 암호화 (대용량 안전 처리)
 // ══════════════════════════════════════════════
 async function deriveKey(p) {
   const e = new TextEncoder();
@@ -461,17 +461,38 @@ async function deriveKey(p) {
     km, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']
   );
 }
+
+// btoa 대신 안전한 ArrayBuffer → base64 변환 (스택 오버플로 방지)
+function ab2b64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let bin = '';
+  const BLOCK = 8192;
+  for (let i = 0; i < bytes.length; i += BLOCK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + BLOCK));
+  }
+  return btoa(bin);
+}
+function b642ab(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
 async function encryptMsg(t, k) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, k, new TextEncoder().encode(t));
-  const c = new Uint8Array(12 + ct.byteLength); c.set(iv); c.set(new Uint8Array(ct), 12);
-  return btoa(String.fromCharCode(...c));
+  const combined = new Uint8Array(12 + ct.byteLength);
+  combined.set(iv); combined.set(new Uint8Array(ct), 12);
+  return ab2b64(combined.buffer);
 }
 async function decryptMsg(b, k) {
   try {
-    const c = Uint8Array.from(atob(b), x => x.charCodeAt(0));
-    const p = await crypto.subtle.decrypt({name:'AES-GCM', iv:c.slice(0,12)}, k, c.slice(12));
-    return new TextDecoder().decode(p);
+    const buf = b642ab(b);
+    const iv = new Uint8Array(buf, 0, 12);
+    const ct = new Uint8Array(buf, 12);
+    const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv}, k, ct);
+    return new TextDecoder().decode(pt);
   } catch { return null; }
 }
 
@@ -801,7 +822,7 @@ reconnectBtn.addEventListener('click', async () => {
   if (!checkEncKey()) return;
   await applyLobbyInputs();
   const fid = getSavedFriendId(); if (!fid || !myPeerId) return;
-  const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
+  const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json', reliable:true});
   setupConnection(c, fid); showChat(); addSysMsg('이전 친구에게 재연결 중...');
 });
 clearSavedBtn.addEventListener('click', () => { clearFriend(); savedBanner.classList.remove('show'); });
@@ -816,7 +837,7 @@ joinBtn.addEventListener('click', async () => {
   const code = joinCodeInput.value.trim(); if (!code) { joinCodeInput.focus(); return; }
   if (!checkEncKey()) return;
   await applyLobbyInputs(); if (!myPeerId) { lobbyStatus.textContent = '잠시 후 다시 시도하세요'; return; }
-  const c = peer.connect(code, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
+  const c = peer.connect(code, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json', reliable:true});
   setupConnection(c, code); showChat(); addSysMsg('연결 중...');
 });
 
@@ -877,7 +898,7 @@ function scheduleReconnect() {
     if (conn && conn.open) return;
     if (encPassphrase && !cryptoKey) cryptoKey = await deriveKey(encPassphrase);
     addSysMsg('재연결 시도 중...');
-    const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}});
+    const c = peer.connect(fid, {metadata:{nick:myNick, peerId:FIXED_MY_ID}, serialization:'json', reliable:true});
     setupConnection(c, fid);
   }, delay);
 }
@@ -1002,8 +1023,8 @@ function compressImage(dataUrl, maxW, maxH, quality) {
 
 async function sendImageSingle(src, msgId) {
   if (!conn || !conn.open) { addSysMsg('⚠️ 연결되지 않았습니다', 'warn'); return; }
-  // 1200px 이하, 품질 0.75로 압축 — 대부분 이미지가 200KB 이하로 줄어듦
-  const compressed = await compressImage(src, 1200, 1200, 0.75);
+  // 800px 이하, 품질 0.6으로 압축 — 전송 패킷 크기 최소화
+  const compressed = await compressImage(src, 800, 800, 0.6);
   const p = { type: 'img', msgId };
   if (cryptoKey) {
     p.encImg = await encryptMsg(compressed, cryptoKey);
